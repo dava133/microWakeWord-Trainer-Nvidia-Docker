@@ -5,7 +5,7 @@ ROOTDIR="$(dirname "${PROGDIR}")"
 KNOWN_ARGS=( data-dir python gpu no-gpu )
 source "${PROGDIR}/shell.functions"
 
-if [ ${#UNKNOWN_ARGS[@]} -gt 0 ] ; then
+if [ ${#UNKNOWN_ARGS[@]}n -gt 0 ] ; then
     echo "Unknown argument(s): ${UNKNOWN_ARGS[*]}" >&2
     HELP=true
 fi
@@ -28,8 +28,12 @@ Environment overrides:
 MWW_TF_SPEC:           Full TensorFlow package spec (e.g. "tf-nightly[and-cuda]"
                        or "tensorflow[and-cuda]==2.20.0").
 MWW_TENSORBOARD_SPEC:  Comma-separated TensorBoard package specs.
-                       Example: "tensorboard==2.20.0,tensorboard-data-server==0.7.2"
 MWW_KERAS_SPEC:        Keras package spec to install explicitly.
+MWW_TORCH_VERSION:     PyTorch and torchaudio version (defaults depend on GPU).
+MWW_TORCH_CUDA:        PyTorch CUDA wheel index suffix (e.g. "cu124").
+
+The GTX 1060 / Pascal profile uses Python 3.10, TensorFlow 2.10.1 with
+CUDA 11.2/cuDNN 8.1, and PyTorch 2.5.0 with CUDA 12.4.
 
 EOF
     exit 1
@@ -63,18 +67,29 @@ detect_gpu_compute_capability() {
 
 GPU_COMPUTE_CAPABILITY=""
 IS_BLACKWELL=false
+IS_PASCAL=false
 if ${GPU} ; then
     GPU_COMPUTE_CAPABILITY="$(detect_gpu_compute_capability || true)"
     case "${GPU_COMPUTE_CAPABILITY}" in
         12.*) IS_BLACKWELL=true ;;
+        6.1) IS_PASCAL=true ;;
         "")
             case "${MWW_BLACKWELL_IMAGE:-}" in
                 1|true|TRUE|yes|YES|on|ON) IS_BLACKWELL=true ;;
             esac
+            case "${MWW_PASCAL_IMAGE:-}" in
+                1|true|TRUE|yes|YES|on|ON) IS_PASCAL=true ;;
+            esac
             ;;
     esac
-    ${IS_BLACKWELL} && echo "   Blackwell GPU detected (compute capability ${GPU_COMPUTE_CAPABILITY:-image default})"
 fi
+# A purpose-built image can select the Pascal stack even when the GPU is not
+# visible during setup (for example, when constructing the image itself).
+case "${MWW_PASCAL_IMAGE:-}" in
+    1|true|TRUE|yes|YES|on|ON) IS_PASCAL=true ;;
+esac
+${IS_BLACKWELL} && echo "   Blackwell GPU detected (compute capability ${GPU_COMPUTE_CAPABILITY:-image default})"
+${IS_PASCAL} && echo "   Pascal GPU profile selected (compute capability ${GPU_COMPUTE_CAPABILITY:-image default})"
 
 VENV="${DATA_DIR}/.venv"
 if [ -n "${VIRTUAL_ENV:-}" ] && [ "${VIRTUAL_ENV}" != "${VENV}" ] ; then
@@ -89,6 +104,10 @@ fi
 if [ -n "${PYTHON}" ] ; then
     PYTHONS=( "${PYTHON}" )
     unset PYTHON
+elif ${IS_PASCAL} ; then
+    # TensorFlow 2.10 is the last official Linux GPU wheel line that supports
+    # Pascal; it requires Python <= 3.10.
+    PYTHONS=( python3.10 )
 else
     # Add 3.11 as a common middle-ground (especially outside Ubuntu 24.04)
     PYTHONS=( python3.12 python3.11 python3.10 )
@@ -99,7 +118,11 @@ for p in "${PYTHONS[@]}" ; do
 done
 
 [ -n "${PYTHON}" ] || {
-    echo "A python 3.12/3.11/3.10 interpreter wasn't found. You'll need to install one before proceeding." >&2
+    if ${IS_PASCAL} ; then
+        echo "Python 3.10 is required for the GTX 1060 Pascal TensorFlow GPU stack." >&2
+    else
+        echo "A python 3.12/3.11/3.10 interpreter wasn't found. You'll need to install one before proceeding." >&2
+    fi
     exit 1
 }
 
@@ -138,12 +161,9 @@ for f in "${progfiles[@]}" ; do
     ln -sfr "${f}" ".venv/bin/$(basename "${f}")"
 done
 
-#
 # Pip doesn't process packages from requirements.txt in order but order is
 # important because tensorflow, torch, onnxruntime and micro-wake-word all
-# depend on CUDA packages at various versions. They need to be installed in
-# this specific order or they may not be able to use the GPU.
-#
+# depend on CUDA packages at various versions.
 export PIP_PROGRESS_BAR=off
 export PIP_NO_COLOR=1
 export PIP_QUIET=0
@@ -160,8 +180,14 @@ pip_install() {
 START_TS=$EPOCHSECONDS
 
 echo "   ===== Installing common requirements ====="
-# requirements.txt lives in repo root now
 pip_install -r "${ROOTDIR}/requirements.txt"
+
+# TF 2.10's GPU wheel requires numpy <1.24. Keep the project's other
+# dependencies while restoring that compatible runtime before installing TF.
+if ${IS_PASCAL} ; then
+    echo "   ===== Selecting Pascal-compatible NumPy ====="
+    pip_install "numpy==1.23.5"
+fi
 
 echo "   ===== Installing microWakeWord runtime dependencies ====="
 pip_install \
@@ -178,11 +204,15 @@ pip_install \
 ${GPU} && tfgpu='[and-cuda]' || tfgpu=""
 declare -a default_tensorboard_specs=()
 
-if ${GPU} && ${IS_BLACKWELL} ; then
+if ${IS_PASCAL} ; then
+    # TF 2.10.1 is the last official TensorFlow Linux GPU wheel line supporting
+    # Pascal (sm_61); CUDA 11.2 and cuDNN 8.1 are supplied by dockerfile.pascal.
+    tfgpu=""
+    DEFAULT_TF_SPEC="tensorflow==2.10.1"
+    default_tensorboard_specs=( "tensorboard==2.10.1" )
+elif ${GPU} && ${IS_BLACKWELL} ; then
     # Blackwell path: prefer nightly TF while upstream stable wheels catch up.
     DEFAULT_TF_SPEC="tf-nightly${tfgpu}"
-    # microWakeWord calls TensorBoard directly while logging training metrics.
-    # Do not rely on nightly TensorFlow metadata to pull it in transitively.
     default_tensorboard_specs=( "tensorboard" )
 else
     DEFAULT_TF_SPEC="tensorflow${tfgpu}==2.20.0"
@@ -206,16 +236,26 @@ fi
 echo "   ===== Installing TensorFlow stack (${TF_SPEC}) ====="
 pip_install "${tf_install_specs[@]}"
 
-${GPU} && torchgpu='--index-url https://download.pytorch.org/whl/cu129' || torchgpu=""
-echo "   ===== Installing torch and torchaudio ${torchgpu:+[cuda]} ====="
-pip_install "torch==2.9.1" "torchaudio==2.9.1" ${torchgpu}
+if ${GPU} ; then
+    if ${IS_PASCAL} ; then
+        torch_cuda="${MWW_TORCH_CUDA:-cu124}"
+        torch_version="${MWW_TORCH_VERSION:-2.5.0}"
+    else
+        torch_cuda="${MWW_TORCH_CUDA:-cu129}"
+        torch_version="${MWW_TORCH_VERSION:-2.9.1}"
+    fi
+    torch_index="--index-url https://download.pytorch.org/whl/${torch_cuda}"
+else
+    torch_version="${MWW_TORCH_VERSION:-2.9.1}"
+    torch_index=""
+fi
+echo "   ===== Installing torch and torchaudio ${torch_index:+[${torch_cuda}]} ====="
+pip_install "torch==${torch_version}" "torchaudio==${torch_version}" ${torch_index}
 
 echo "   ===== Checking microwakeword ====="
 MWW="${DATA_DIR}/tools/microWakeWord"
 "${PROGDIR}/ensure_microwakeword_source" "${DATA_DIR}"
 echo "   Installing microwakeword"
-# The dependencies are installed explicitly above so pip cannot replace the
-# selected TensorFlow build while resolving microwakeword's generic TF floor.
 pip_install --no-deps -e "${MWW}"
 
 echo "   ===== Checking piper-sample-generator ====="
@@ -244,7 +284,6 @@ MODELS_DIR="${PSG}/models"
 VOICES_DIR="${PSG}/voices"
 mkdir -p "${VOICES_DIR}"
 
-# --- English generator model (multi-speaker, used with --language=en) ---
 MODEL_NAME="en_US-libritts_r-medium.pt"
 MODEL_FILE="${MODELS_DIR}/${MODEL_NAME}"
 MODEL_URL="${PSG_GITHUB_ROOT}/releases/download/models/${MODEL_NAME}"
@@ -260,32 +299,31 @@ fi
 
 echo "   Non-English Piper voices will be downloaded on demand for the selected language."
 
-${GPU} && onnxgpu='-gpu[cuda]' || onnxgpu=""
+if ${GPU} && ! ${IS_PASCAL} ; then
+    onnxgpu='-gpu[cuda]'
+else
+    # Feature extraction is CPU ONNX in the current trainers; avoid installing
+    # a CUDA ORT build that is not needed for this Pascal profile.
+    onnxgpu=""
+fi
 echo "   ===== Installing onnxruntime${onnxgpu} ====="
 pip_install "onnxruntime${onnxgpu}>=1.16.0"
 
 echo "   ===== Installing keras ====="
-# Default: keep the known-good pin with stable TF 2.20.
-# For tf-nightly/custom TF specs, skip this pin unless explicitly requested.
 if [ -n "${MWW_KERAS_SPEC:-}" ] ; then
     pip_install "${MWW_KERAS_SPEC}"
+elif ${IS_PASCAL} ; then
+    pip_install "keras==2.10.0"
 elif [ -n "${MWW_TF_SPEC:-}" ] || [[ "${TF_SPEC}" == tf-nightly* ]] ; then
     echo "   Skipping explicit keras pin for ${TF_SPEC} (set MWW_KERAS_SPEC to force one)."
 else
     pip_install "keras==3.12.0"
 fi
 
-# -----------------------------------------------------------------------------
-# Optional CUDA data dir (GPU-only)
-# Some stacks expect a CUDA "nvvm/libdevice" tree. We create one in /data/cuda
-# and link Triton's libdevice if it exists. This is safe and does NOT enable
-# any extra XLA flags by itself.
-# -----------------------------------------------------------------------------
 if ${GPU} ; then
     CUDA_DATA_DIR="${DATA_DIR}/cuda"
     LIBDEVICE_DIR="${CUDA_DATA_DIR}/nvvm/libdevice"
     mkdir -p "${LIBDEVICE_DIR}"
-
     TRITON_LIBDEVICE="$(
         python - <<'PY'
 import glob
@@ -293,7 +331,6 @@ paths = glob.glob("**/site-packages/triton/backends/nvidia/lib/libdevice.10.bc",
 print(paths[0] if paths else "", end="")
 PY
     )"
-
     if [ -n "${TRITON_LIBDEVICE}" ] ; then
         ln -sf "${TRITON_LIBDEVICE}" "${LIBDEVICE_DIR}/libdevice.10.bc"
         echo "   Linked Triton libdevice.10.bc to ${LIBDEVICE_DIR}"
@@ -309,5 +346,4 @@ touch .mww-data-dir
 END_TS=$EPOCHSECONDS
 
 echo "Run 'source ${VENV}/bin/activate' to activate the new virtualenv in the current shell."
-
 print_elapsed_time "${START_TS}" "${END_TS}" "Python package installation complete"
