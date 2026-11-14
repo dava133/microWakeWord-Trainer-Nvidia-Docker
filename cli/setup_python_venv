@@ -47,12 +47,18 @@ fi
 
 cd "${DATA_DIR}"
 
+has_nvidia_gpu() {
+    [ -c /dev/nvidiactl ] || [ -c /dev/dxg ] || {
+        command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1
+    }
+}
+
 [ -z "${GPU}" ] && {
     GPU=false
-    [ -c /dev/nvidiactl ] && {
+    if has_nvidia_gpu; then
         GPU=true
         echo "   Nvidia GPU detected"
-    }
+    fi
 }
 
 "${GPU}" || export CUDA_VISIBLE_DEVICES=-1
